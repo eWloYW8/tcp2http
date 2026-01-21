@@ -14,6 +14,8 @@ const (
 	FrameHeartbeat = 0x02
 	FrameClose     = 0x03
 	FramePadding   = 0x04
+
+	MaxFrameSize = 10 * 1024 * 1024
 )
 
 func frameName(t byte) string {
@@ -86,6 +88,11 @@ func readFrame(fl FrameLogger, r io.Reader) (byte, []byte, error) {
 	}
 	t := header[0]
 	size := binary.BigEndian.Uint32(header[1:])
+
+	if size > MaxFrameSize {
+		return t, nil, fmt.Errorf("frame size too large: %d", size)
+	}
+
 	fl.LogRecv(t, int(size))
 
 	var payload []byte

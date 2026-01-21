@@ -12,29 +12,29 @@ import (
 )
 
 type Tunnel struct {
-	id string
-
+	id      string
 	TCPConn net.Conn
-
-	UpBody io.Reader
-
-	DownW     http.ResponseWriter
-	DownFlush http.Flusher
 
 	UpReady   chan struct{}
 	DownReady chan struct{}
 
-	closeOnce sync.Once
-	closeCh   chan struct{}
+	mu      sync.Mutex
+	UpBody  io.Reader
+	closed  bool
+	closeCh chan struct{}
 }
 
 func (t *Tunnel) Close() {
-	t.closeOnce.Do(func() {
-		close(t.closeCh)
-		if t.TCPConn != nil {
-			_ = t.TCPConn.Close()
-		}
-	})
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	t.closed = true
+	close(t.closeCh)
+	if t.TCPConn != nil {
+		_ = t.TCPConn.Close()
+	}
 }
 
 type TunnelStore struct {
@@ -46,13 +46,6 @@ func NewTunnelStore() *TunnelStore {
 	return &TunnelStore{tunnels: make(map[string]*Tunnel)}
 }
 
-func (s *TunnelStore) Get(id string) (*Tunnel, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tunnels[id]
-	return t, ok
-}
-
 func (s *TunnelStore) GetOrCreate(id string, dialTarget string) (*Tunnel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +54,7 @@ func (s *TunnelStore) GetOrCreate(id string, dialTarget string) (*Tunnel, error)
 		return t, nil
 	}
 
-	conn, err := net.Dial("tcp", dialTarget)
+	conn, err := net.DialTimeout("tcp", dialTarget, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -84,298 +77,169 @@ func (s *TunnelStore) Delete(id string) {
 }
 
 func runServer(args []string) error {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
 	cfg, err := parseServerFlags(args)
 	if err != nil {
 		return err
 	}
-
 	store := NewTunnelStore()
-
 	mux := http.NewServeMux()
-	mux.HandleFunc(cfg.UpPath, func(w http.ResponseWriter, r *http.Request) {
-		handleUp(cfg, store, w, r)
-	})
-	mux.HandleFunc(cfg.DownPath, func(w http.ResponseWriter, r *http.Request) {
-		handleDown(cfg, store, w, r)
-	})
-
-	srv := &http.Server{
-		Addr:    cfg.HTTPListenAddr,
-		Handler: mux,
-	}
-
-	log.Printf("[server] listening on %s (up=%s down=%s target=%s)", cfg.HTTPListenAddr, cfg.UpPath, cfg.DownPath, cfg.TargetTCP)
-	return srv.ListenAndServe()
+	mux.HandleFunc(cfg.UpPath, func(w http.ResponseWriter, r *http.Request) { handleUp(cfg, store, w, r) })
+	mux.HandleFunc(cfg.DownPath, func(w http.ResponseWriter, r *http.Request) { handleDown(cfg, store, w, r) })
+	log.Printf("[server] listening on %s", cfg.HTTPListenAddr)
+	return http.ListenAndServe(cfg.HTTPListenAddr, mux)
 }
 
 func handleUp(cfg *ServerConfig, store *TunnelStore, w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.Header.Get(cfg.SessionHeader))
+	id := r.Header.Get(cfg.SessionHeader)
 	if id == "" {
-		http.Error(w, "missing session header", http.StatusBadRequest)
+		http.Error(w, "no session", 400)
 		return
 	}
-	log.Printf("[server-up] session=%s from=%s content-length=%d", id, r.RemoteAddr, r.ContentLength)
 
 	tunnel, err := store.GetOrCreate(id, cfg.TargetTCP)
 	if err != nil {
-		log.Printf("[server-up] session=%s dial target failed: %v", id, err)
-		http.Error(w, "tcp connect failed", http.StatusInternalServerError)
+		http.Error(w, "dial fail", 500)
 		return
 	}
-	log.Printf("[server-up] session=%s target=%s", id, tunnel.TCPConn.RemoteAddr())
 
-	// Select body reader (multipart or raw)
-	var body io.Reader
-	ct := r.Header.Get("Content-Type")
-
-	if cfg.AcceptMultipart && strings.HasPrefix(ct, "multipart/form-data") {
-		mr, err := r.MultipartReader()
-		if err != nil {
-			log.Printf("[server-up] session=%s multipart reader error: %v", id, err)
-			http.Error(w, "multipart error", http.StatusBadRequest)
-			return
-		}
-		found := false
+	var body io.Reader = r.Body
+	if cfg.AcceptMultipart && strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		mr, _ := r.MultipartReader()
 		for {
-			part, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
+			p, err := mr.NextPart()
 			if err != nil {
-				log.Printf("[server-up] session=%s next part error: %v", id, err)
 				break
 			}
-			if part.FormName() == cfg.MultipartFormName {
-				body = part
-				found = true
+			if p.FormName() == cfg.MultipartFormName {
+				body = p
 				break
 			}
 		}
-		if !found {
-			http.Error(w, "multipart file part not found", http.StatusBadRequest)
-			tunnel.Close()
-			store.Delete(id)
-			return
-		}
-	} else {
-		body = r.Body
 	}
 
+	tunnel.mu.Lock()
 	tunnel.UpBody = body
+	tunnel.mu.Unlock()
 
-	// signal UpReady
 	select {
 	case <-tunnel.UpReady:
 	default:
 		close(tunnel.UpReady)
 	}
 
-	// wait for DownReady
+	// 等待 Down 侧就绪
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.WaitPeerTimeout)
 	defer cancel()
 
 	select {
 	case <-tunnel.DownReady:
-	case <-tunnel.closeCh:
-		http.Error(w, "tunnel closed", http.StatusGone)
-		store.Delete(id)
-		return
 	case <-ctx.Done():
-		http.Error(w, "timeout waiting for /down", http.StatusGatewayTimeout)
 		tunnel.Close()
 		store.Delete(id)
 		return
 	}
 
-	fl := FrameLogger{Prefix: "server-up", LogHeartbeat: false}
-
-	bufToTCP := func(p []byte) error {
-		_, err := tunnel.TCPConn.Write(p)
-		return err
-	}
-
-ReadLoop:
+	fl := FrameLogger{Prefix: "server-up"}
 	for {
-		select {
-		case <-tunnel.closeCh:
-			store.Delete(id)
-			return
-		default:
-		}
-
 		t, payload, err := readFrame(fl, tunnel.UpBody)
 		if err != nil {
-			break ReadLoop
+			break
 		}
-
-		switch t {
-		case FrameData:
-			if err := bufToTCP(payload); err != nil {
-				break ReadLoop
-			}
-		case FramePadding:
-			// drop
-		case FrameHeartbeat:
-			// ignore
-		case FrameClose:
-			tunnel.Close()
-			store.Delete(id)
-			return
-		default:
-			// ignore unknown
+		if t == FrameData {
+			_, err = tunnel.TCPConn.Write(payload)
+		} else if t == FrameClose {
+			break
+		}
+		if err != nil {
+			break
 		}
 	}
-
 	tunnel.Close()
 	store.Delete(id)
-	log.Printf("[server-up] session=%s exited", id)
 }
 
 func handleDown(cfg *ServerConfig, store *TunnelStore, w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	id := strings.TrimSpace(r.Header.Get(cfg.SessionHeader))
-	if id == "" {
-		http.Error(w, "missing session header", http.StatusBadRequest)
-		return
-	}
-	log.Printf("[server-down] session=%s from=%s", id, r.RemoteAddr)
-
+	id := r.Header.Get(cfg.SessionHeader)
 	tunnel, err := store.GetOrCreate(id, cfg.TargetTCP)
 	if err != nil {
-		log.Printf("[server-down] session=%s dial target failed: %v", id, err)
-		http.Error(w, "tcp connect failed", http.StatusInternalServerError)
+		http.Error(w, "dial fail", 500)
 		return
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		tunnel.Close()
-		store.Delete(id)
+		http.Error(w, "no flush", 500)
 		return
 	}
 
-	// signal DownReady
 	select {
 	case <-tunnel.DownReady:
 	default:
 		close(tunnel.DownReady)
 	}
 
-	// wait for UpReady BEFORE writing 200
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.WaitPeerTimeout)
 	defer cancel()
 
 	select {
 	case <-tunnel.UpReady:
-		// ok
-	case <-tunnel.closeCh:
-		http.Error(w, "tunnel closed", http.StatusGone)
-		store.Delete(id)
-		return
 	case <-ctx.Done():
-		http.Error(w, "timeout waiting for /up", http.StatusGatewayTimeout)
 		tunnel.Close()
 		store.Delete(id)
 		return
 	}
 
-	// now it's safe to write headers + 200
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 关键：立即刷新 Header
 
-	tunnel.DownW = w
-	tunnel.DownFlush = flusher
-
-	frameLog := FrameLogger{Prefix: "server-down", LogHeartbeat: false}
-
-	// reader: TCP -> channel
-	type readResult struct {
-		n   int
-		err error
-		buf []byte
-	}
-	readCh := make(chan readResult, 8)
-
+	readCh := make(chan []byte, 8)
 	go func() {
 		defer close(readCh)
 		for {
 			buf := make([]byte, cfg.BufferSize)
 			n, err := tunnel.TCPConn.Read(buf)
-			readCh <- readResult{n: n, err: err, buf: buf}
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				select {
+				case readCh <- data:
+				case <-tunnel.closeCh:
+					return
+				}
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
 
-	var paddingBuf []byte
-	if cfg.PaddingEnabled && cfg.PaddingSize > 0 {
-		paddingBuf = make([]byte, cfg.PaddingSize)
-	}
-
-	var hbTick *time.Ticker
-	if cfg.HeartbeatInterval > 0 {
-		hbTick = time.NewTicker(cfg.HeartbeatInterval)
-		defer hbTick.Stop()
-	}
-
-	writeAndFlush := func(t byte, payload []byte) error {
-		if err := writeFrame(frameLog, w, t, payload); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	}
+	tk := time.NewTicker(cfg.HeartbeatInterval)
+	defer tk.Stop()
+	fl := FrameLogger{Prefix: "server-down"}
 
 	for {
 		select {
-		case <-tunnel.closeCh:
-			store.Delete(id)
-			return
-
-		case res, ok := <-readCh:
+		case data, ok := <-readCh:
 			if !ok {
 				goto End
 			}
-			if res.n > 0 {
-				if err := writeAndFlush(FrameData, res.buf[:res.n]); err != nil {
-					goto End
-				}
-				if cfg.PaddingEnabled && len(paddingBuf) > 0 {
-					if err := writeAndFlush(FramePadding, paddingBuf); err != nil {
-						goto End
-					}
-				}
+			_ = writeFrame(fl, w, FrameData, data)
+			if cfg.PaddingEnabled {
+				_ = writeFrame(fl, w, FramePadding, make([]byte, cfg.PaddingSize))
 			}
-			if res.err != nil {
-				goto End
-			}
-
-		case <-func() <-chan time.Time {
-			if hbTick == nil {
-				return nil
-			}
-			return hbTick.C
-		}():
-			_ = writeAndFlush(FrameHeartbeat, nil)
-
+			flusher.Flush()
+		case <-tk.C:
+			_ = writeFrame(fl, w, FrameHeartbeat, nil)
+			flusher.Flush()
 		case <-r.Context().Done():
+			goto End
+		case <-tunnel.closeCh:
 			goto End
 		}
 	}
-
 End:
-	_ = writeAndFlush(FrameClose, nil)
+	_ = writeFrame(fl, w, FrameClose, nil)
 	tunnel.Close()
 	store.Delete(id)
-	log.Printf("[server-down] session=%s exited", id)
 }

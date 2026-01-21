@@ -49,7 +49,6 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// -------- /up: streaming request body via Pipe --------
 	prUp, pwUp := io.Pipe()
 
 	var multipartBoundary string
@@ -60,35 +59,28 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 	reqUp, err := http.NewRequestWithContext(ctx, "POST", cfg.UpURL, prUp)
 	if err != nil {
 		log.Printf("[client] session=%s build up request error: %v", sessionID, err)
+		_ = pwUp.Close()
 		return
 	}
 	reqUp.Header.Set(cfg.SessionHeader, sessionID)
-	reqUp.TransferEncoding = []string{"chunked"}
+	reqUp.ContentLength = -1
 
 	if cfg.Multipart {
 		reqUp.Header.Set("Content-Type", "multipart/form-data; boundary="+multipartBoundary)
 	} else {
 		reqUp.Header.Set("Content-Type", "application/octet-stream")
 	}
-	if err := cfg.HeadersUp.Apply(reqUp.Header); err != nil {
-		log.Printf("[client] session=%s apply up headers error: %v", sessionID, err)
-		return
-	}
+	_ = cfg.HeadersUp.Apply(reqUp.Header)
 
-	// -------- /down: request --------
 	reqDown, err := http.NewRequestWithContext(ctx, "POST", cfg.DownURL, nil)
 	if err != nil {
 		log.Printf("[client] session=%s build down request error: %v", sessionID, err)
+		_ = pwUp.Close()
 		return
 	}
 	reqDown.Header.Set(cfg.SessionHeader, sessionID)
-	reqDown.Header.Set("Content-Length", "0")
-	if err := cfg.HeadersDown.Apply(reqDown.Header); err != nil {
-		log.Printf("[client] session=%s apply down headers error: %v", sessionID, err)
-		return
-	}
+	_ = cfg.HeadersDown.Apply(reqDown.Header)
 
-	// 收敛：任何一边失败都 cancel，另一边退出
 	errCh := make(chan error, 3)
 
 	// 1) /up http goroutine
@@ -98,13 +90,13 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 			errCh <- fmt.Errorf("up-http: %w", err)
 			return
 		}
+		defer resp.Body.Close()
 		log.Printf("[client-up-http] session=%s status=%s", sessionID, resp.Status)
 		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
 		errCh <- fmt.Errorf("up-http: closed")
 	}()
 
-	// 2) /up writer goroutine (tcp -> frame -> pipe)
+	// 2) /up writer goroutine
 	go func() {
 		defer func() {
 			_ = writeFrame(FrameLogger{Prefix: "client-up", LogHeartbeat: cfg.LogHeartbeat}, pwUp, FrameClose, nil)
@@ -115,23 +107,18 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 			_ = pwUp.Close()
 		}()
 
-		// multipart part header
 		if cfg.Multipart {
 			partHeader := fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=%q; filename=%q\r\nContent-Type: application/octet-stream\r\n\r\n",
 				multipartBoundary, cfg.MultipartFN, cfg.MultipartFF)
 			if _, err := pwUp.Write([]byte(partHeader)); err != nil {
-				errCh <- fmt.Errorf("up-writer: write multipart header: %w", err)
+				errCh <- fmt.Errorf("up-writer: %w", err)
 				return
 			}
 		}
 
 		fl := FrameLogger{Prefix: "client-up", LogHeartbeat: cfg.LogHeartbeat}
-
-		// Pipe 写入串行化：heartbeat + data
 		var mu sync.Mutex
 
-		// heartbeat
-		var hbDone = make(chan struct{})
 		if cfg.HeartbeatInterval > 0 {
 			go func() {
 				tk := time.NewTicker(cfg.HeartbeatInterval)
@@ -139,7 +126,6 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 				for {
 					select {
 					case <-ctx.Done():
-						close(hbDone)
 						return
 					case <-tk.C:
 						mu.Lock()
@@ -148,8 +134,6 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 					}
 				}
 			}()
-		} else {
-			close(hbDone)
 		}
 
 		buf := make([]byte, cfg.BufferSize)
@@ -159,21 +143,12 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 		}
 
 		for {
-			select {
-			case <-ctx.Done():
-				<-hbDone
-				errCh <- fmt.Errorf("up-writer: ctx done")
-				return
-			default:
-			}
-
 			n, err := tcpConn.Read(buf)
 			if n > 0 {
 				mu.Lock()
 				if e := writeFrame(fl, pwUp, FrameData, buf[:n]); e != nil {
 					mu.Unlock()
-					<-hbDone
-					errCh <- fmt.Errorf("up-writer: write data: %w", e)
+					errCh <- fmt.Errorf("up-writer: write: %w", e)
 					return
 				}
 				if cfg.PaddingEnabled && len(paddingBuf) > 0 {
@@ -182,8 +157,7 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 				mu.Unlock()
 			}
 			if err != nil {
-				<-hbDone
-				errCh <- fmt.Errorf("up-writer: tcp read: %w", err)
+				errCh <- fmt.Errorf("up-writer: tcp: %w", err)
 				return
 			}
 		}
@@ -196,66 +170,52 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 			errCh <- fmt.Errorf("down: %w", err)
 			return
 		}
-		defer func() {
-			_ = respDown.Body.Close()
-		}()
+		defer respDown.Body.Close()
 
 		log.Printf("[client-down] session=%s connected status=%s", sessionID, respDown.Status)
 
-		// 先读前 256 字节做探测：如果不是 frame 流，直接打印出来（避免把 HTML 当 frame）
-		peek := make([]byte, 256)
-		n, _ := io.ReadAtLeast(respDown.Body, peek, 5)
-		peek = peek[:n]
-
-		// 拼回去继续读
-		r := io.MultiReader(bytesReader(peek), respDown.Body)
-
-		if len(peek) > 0 && !isValidFrameType(peek[0]) {
-			log.Printf("[client-down] session=%s NOT framed stream. firstByte=0x%02x.",
-				sessionID, peek[0])
-			errCh <- fmt.Errorf("down: not framed stream (likely HTML/login/error page)")
+		peek := make([]byte, 5)
+		n, err := io.ReadFull(respDown.Body, peek)
+		if err != nil {
+			errCh <- fmt.Errorf("down: peek failed: %w", err)
 			return
 		}
 
+		if !isValidFrameType(peek[0]) {
+			errCh <- fmt.Errorf("down: invalid stream start 0x%02x", peek[0])
+			return
+		}
+
+		r := io.MultiReader(&staticReader{b: peek[:n]}, respDown.Body)
 		fl := FrameLogger{Prefix: "client-down", LogHeartbeat: cfg.LogHeartbeat}
 		for {
 			t, payload, err := readFrame(fl, r)
 			if err != nil {
-				errCh <- fmt.Errorf("down: readFrame: %w", err)
+				errCh <- fmt.Errorf("down: read: %w", err)
 				return
 			}
-			switch t {
-			case FrameData:
+			if t == FrameData {
 				if _, err := tcpConn.Write(payload); err != nil {
-					errCh <- fmt.Errorf("down: write tcp: %w", err)
+					errCh <- fmt.Errorf("down: tcp write: %w", err)
 					return
 				}
-			case FramePadding:
-			case FrameHeartbeat:
-			case FrameClose:
-				errCh <- fmt.Errorf("down: close frame")
+			} else if t == FrameClose {
+				errCh <- fmt.Errorf("down: server closed")
 				return
-			default:
-				// ignore unknown
 			}
 		}
 	}()
 
-	// 任何一个 goroutine 报错/结束，统一收敛关闭
 	firstErr := <-errCh
 	cancel()
 	_ = pwUp.Close()
-	_ = tcpConn.Close()
-
-	log.Printf("[client] session=%s closed (%v)", sessionID, firstErr)
+	log.Printf("[client] session=%s closed: %v", sessionID, firstErr)
 }
 
 type staticReader struct {
 	b []byte
 	i int
 }
-
-func bytesReader(b []byte) io.Reader { return &staticReader{b: b} }
 
 func (sr *staticReader) Read(p []byte) (int, error) {
 	if sr.i >= len(sr.b) {
@@ -265,12 +225,6 @@ func (sr *staticReader) Read(p []byte) (int, error) {
 	sr.i += n
 	return n, nil
 }
-
 func isValidFrameType(t byte) bool {
-	switch t {
-	case FrameData, FrameHeartbeat, FrameClose, FramePadding:
-		return true
-	default:
-		return false
-	}
+	return t >= 0x01 && t <= 0x04
 }
