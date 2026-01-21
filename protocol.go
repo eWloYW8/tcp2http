@@ -16,6 +16,7 @@ const (
 	FrameHeartbeat = 0x02
 	FrameClose     = 0x03
 	FramePadding   = 0x04
+	FrameOpen      = 0x05
 	MaxFrameSize   = 10 * 1024 * 1024
 )
 
@@ -35,6 +36,8 @@ func frameName(t byte) string {
 		return "CLOSE"
 	case FramePadding:
 		return "PADDING"
+	case FrameOpen:
+		return "OPEN"
 	default:
 		return fmt.Sprintf("UNKNOWN(0x%02x)", t)
 	}
@@ -57,18 +60,18 @@ type FrameLogger struct {
 	LogHeartbeat bool
 }
 
-func (fl FrameLogger) LogSend(t byte, payloadLen int) {
+func (fl FrameLogger) LogSend(t byte, channel uint32, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] >>> %s | Len=%d", fl.Prefix, frameName(t), payloadLen)
+	log.Printf("[%s] >>> %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
 }
 
-func (fl FrameLogger) LogRecv(t byte, payloadLen int) {
+func (fl FrameLogger) LogRecv(t byte, channel uint32, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] <<< %s | Len=%d", fl.Prefix, frameName(t), payloadLen)
+	log.Printf("[%s] <<< %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
 }
 
 type SafeWriter struct {
@@ -92,13 +95,13 @@ func (sw *SafeWriter) CheckAndResetDataSent() bool {
 	return sw.dataSentInInterval.Swap(false)
 }
 
-func (sw *SafeWriter) WriteFrame(fl FrameLogger, t byte, payload []byte) error {
+func (sw *SafeWriter) WriteFrame(fl FrameLogger, t byte, channel uint32, payload []byte) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
-	return sw.writeRaw(fl, t, payload)
+	return sw.writeRaw(fl, t, channel, payload)
 }
 
-func (sw *SafeWriter) TryWriteFrame(fl FrameLogger, t byte, payload []byte) (bool, error) {
+func (sw *SafeWriter) TryWriteFrame(fl FrameLogger, t byte, channel uint32, payload []byte) (bool, error) {
 	if sw.priorityWaiting.Load() > 0 {
 		return false, nil
 	}
@@ -106,19 +109,20 @@ func (sw *SafeWriter) TryWriteFrame(fl FrameLogger, t byte, payload []byte) (boo
 		return false, nil
 	}
 	defer sw.mu.Unlock()
-	err := sw.writeRaw(fl, t, payload)
+	err := sw.writeRaw(fl, t, channel, payload)
 	return true, err
 }
 
-func (sw *SafeWriter) writeRaw(fl FrameLogger, t byte, payload []byte) error {
+func (sw *SafeWriter) writeRaw(fl FrameLogger, t byte, channel uint32, payload []byte) error {
 	if t == FrameData {
 		sw.dataSentInInterval.Store(true)
 	}
 
-	fl.LogSend(t, len(payload))
-	header := make([]byte, 5)
+	fl.LogSend(t, channel, len(payload))
+	header := make([]byte, 9)
 	header[0] = t
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[1:5], channel)
+	binary.BigEndian.PutUint32(header[5:], uint32(len(payload)))
 	if _, err := sw.w.Write(header); err != nil {
 		return err
 	}
@@ -129,22 +133,24 @@ func (sw *SafeWriter) writeRaw(fl FrameLogger, t byte, payload []byte) error {
 	return nil
 }
 
-func readFrame(fl FrameLogger, r io.Reader) (byte, []byte, error) {
-	header := make([]byte, 5)
+func readFrame(fl FrameLogger, r io.Reader) (byte, uint32, []byte, error) {
+	header := make([]byte, 9)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, err
+		return 0, 0, nil, err
 	}
-	t, size := header[0], binary.BigEndian.Uint32(header[1:])
+	t := header[0]
+	channel := binary.BigEndian.Uint32(header[1:5])
+	size := binary.BigEndian.Uint32(header[5:])
 	if size > MaxFrameSize {
-		return t, nil, fmt.Errorf("frame too large: %d", size)
+		return t, channel, nil, fmt.Errorf("frame too large: %d", size)
 	}
-	fl.LogRecv(t, int(size))
+	fl.LogRecv(t, channel, int(size))
 	var payload []byte
 	if size > 0 {
 		payload = make([]byte, size)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return t, nil, err
+			return t, channel, nil, err
 		}
 	}
-	return t, payload, nil
+	return t, channel, payload, nil
 }
