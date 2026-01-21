@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 )
 
 const (
@@ -14,8 +15,7 @@ const (
 	FrameHeartbeat = 0x02
 	FrameClose     = 0x03
 	FramePadding   = 0x04
-
-	MaxFrameSize = 10 * 1024 * 1024
+	MaxFrameSize   = 10 * 1024 * 1024
 )
 
 func frameName(t byte) string {
@@ -54,27 +54,37 @@ func (fl FrameLogger) LogSend(t byte, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] >>> %s | Payload=%d", fl.Prefix, frameName(t), payloadLen)
+	log.Printf("[%s] >>> %s | Len=%d", fl.Prefix, frameName(t), payloadLen)
 }
 
 func (fl FrameLogger) LogRecv(t byte, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] <<< %s | Payload=%d", fl.Prefix, frameName(t), payloadLen)
+	log.Printf("[%s] <<< %s | Len=%d", fl.Prefix, frameName(t), payloadLen)
 }
 
-func writeFrame(fl FrameLogger, w io.Writer, frameType byte, payload []byte) error {
-	fl.LogSend(frameType, len(payload))
+type SafeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
 
-	header := []byte{frameType, 0, 0, 0, 0}
+func NewSafeWriter(w io.Writer) *SafeWriter { return &SafeWriter{w: w} }
+
+func (sw *SafeWriter) WriteFrame(fl FrameLogger, t byte, payload []byte) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	fl.LogSend(t, len(payload))
+	header := make([]byte, 5)
+	header[0] = t
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
 
-	if _, err := w.Write(header); err != nil {
+	if _, err := sw.w.Write(header); err != nil {
 		return err
 	}
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
+		if _, err := sw.w.Write(payload); err != nil {
 			return err
 		}
 	}
@@ -86,15 +96,11 @@ func readFrame(fl FrameLogger, r io.Reader) (byte, []byte, error) {
 	if _, err := io.ReadFull(r, header); err != nil {
 		return 0, nil, err
 	}
-	t := header[0]
-	size := binary.BigEndian.Uint32(header[1:])
-
+	t, size := header[0], binary.BigEndian.Uint32(header[1:])
 	if size > MaxFrameSize {
-		return t, nil, fmt.Errorf("frame size too large: %d", size)
+		return t, nil, fmt.Errorf("frame too large: %d", size)
 	}
-
 	fl.LogRecv(t, int(size))
-
 	var payload []byte
 	if size > 0 {
 		payload = make([]byte, size)
