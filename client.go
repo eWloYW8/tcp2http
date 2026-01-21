@@ -58,7 +58,7 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 	_ = cfg.HeadersUp.Apply(reqUp.Header)
 
 	errCh := make(chan error, 2)
-	// UP HTTP
+
 	go func() {
 		resp, err := httpClient.Do(reqUp)
 		if err != nil {
@@ -70,7 +70,6 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 		errCh <- fmt.Errorf("up-http-closed")
 	}()
 
-	// UP WRITER
 	go func() {
 		fl := FrameLogger{Prefix: "client-up", LogHeartbeat: cfg.LogHeartbeat}
 		if cfg.Multipart {
@@ -79,44 +78,33 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 			_, _ = pw.Write([]byte(h))
 		}
 
-		if cfg.HeartbeatInterval > 0 {
-			go func() {
-				tk := time.NewTicker(cfg.HeartbeatInterval)
-				defer tk.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-tk.C:
-						_ = swUp.WriteFrame(fl, FrameHeartbeat, nil)
-					}
-				}
-			}()
-		}
-
 		buf := make([]byte, cfg.BufferSize)
 		for {
 			n, err := tcpConn.Read(buf)
 			if n > 0 {
+				swUp.SetPriority(true)
 				if e := swUp.WriteFrame(fl, FrameData, buf[:n]); e != nil {
+					swUp.SetPriority(false)
 					break
 				}
-				if cfg.PaddingEnabled {
+				if cfg.PaddingMode == PaddingPerPacket {
 					_ = swUp.WriteFrame(fl, FramePadding, make([]byte, cfg.PaddingSize))
 				}
+				swUp.SetPriority(false)
 			}
 			if err != nil {
 				break
 			}
 		}
+
 		_ = swUp.WriteFrame(fl, FrameClose, nil)
 		if cfg.Multipart {
 			_, _ = pw.Write([]byte("\r\n--" + boundary + "--\r\n"))
 		}
 		pw.Close()
+		cancel()
 	}()
 
-	// DOWN
 	go func() {
 		reqDown, _ := http.NewRequestWithContext(ctx, "POST", cfg.DownURL, nil)
 		reqDown.Header.Set(cfg.SessionHeader, sessionID)
@@ -145,5 +133,39 @@ func handleClientConn(cfg *ClientConfig, tcpConn net.Conn) {
 		errCh <- fmt.Errorf("down-closed")
 	}()
 
-	log.Printf("[client] session=%s closed: %v", sessionID, <-errCh)
+	flUp := FrameLogger{Prefix: "client-up", LogHeartbeat: cfg.LogHeartbeat}
+	hbTicker := &time.Ticker{C: make(<-chan time.Time)}
+	if cfg.HeartbeatInterval > 0 {
+		hbTicker = time.NewTicker(cfg.HeartbeatInterval)
+	}
+
+	padTicker := &time.Ticker{C: make(<-chan time.Time)}
+	if cfg.PaddingMode == PaddingInterval && cfg.PaddingInterval > 0 {
+		padTicker = time.NewTicker(cfg.PaddingInterval)
+	}
+	defer hbTicker.Stop()
+	defer padTicker.Stop()
+
+	for {
+		select {
+		case <-hbTicker.C:
+			if err := swUp.WriteFrame(flUp, FrameHeartbeat, nil); err != nil {
+				goto DONE
+			}
+		case <-padTicker.C:
+			if swUp.CheckAndResetDataSent() {
+				if _, err := swUp.TryWriteFrame(flUp, FramePadding, make([]byte, cfg.PaddingSize)); err != nil {
+					goto DONE
+				}
+			}
+		case <-ctx.Done():
+			goto DONE
+		case err := <-errCh:
+			log.Printf("[client] session=%s error: %v", sessionID, err)
+			return
+		}
+	}
+
+DONE:
+	log.Printf("[client] session=%s closing", sessionID)
 }

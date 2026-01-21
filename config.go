@@ -42,7 +42,8 @@ type ClientConfig struct {
 	MultipartFN, MultipartFF string
 	BufferSize               int
 	HeartbeatInterval        time.Duration
-	PaddingEnabled           bool
+	PaddingMode              string
+	PaddingInterval          time.Duration
 	PaddingSize              int
 	HTTPTimeout              time.Duration
 	LogHeartbeat             bool
@@ -55,7 +56,8 @@ type ServerConfig struct {
 	TargetTCP         string
 	BufferSize        int
 	HeartbeatInterval time.Duration
-	PaddingEnabled    bool
+	PaddingMode       string
+	PaddingInterval   time.Duration
 	PaddingSize       int
 	AcceptMultipart   bool
 	MultipartFormName string
@@ -76,7 +78,8 @@ func parseClientFlags(args []string) (*ClientConfig, error) {
 	fs.StringVar(&cfg.MultipartFF, "multipart-file", "upload.bin", "")
 	fs.IntVar(&cfg.BufferSize, "buf", 4096, "")
 	fs.DurationVar(&cfg.HeartbeatInterval, "hb", 100*time.Millisecond, "")
-	fs.BoolVar(&cfg.PaddingEnabled, "padding", true, "")
+	fs.StringVar(&cfg.PaddingMode, "padding-mode", PaddingNone, "none, per-packet, interval")
+	fs.DurationVar(&cfg.PaddingInterval, "padding-interval", 500*time.Millisecond, "")
 	fs.IntVar(&cfg.PaddingSize, "padding-size", 4096, "")
 	fs.DurationVar(&cfg.HTTPTimeout, "http-timeout", 0, "")
 	fs.BoolVar(&cfg.LogHeartbeat, "log-heartbeat", false, "")
@@ -100,7 +103,8 @@ func parseServerFlags(args []string) (*ServerConfig, error) {
 	fs.StringVar(&cfg.TargetTCP, "target", "127.0.0.1:22", "")
 	fs.IntVar(&cfg.BufferSize, "buf", 4096, "")
 	fs.DurationVar(&cfg.HeartbeatInterval, "hb", 100*time.Millisecond, "")
-	fs.BoolVar(&cfg.PaddingEnabled, "padding", true, "")
+	fs.StringVar(&cfg.PaddingMode, "padding-mode", PaddingNone, "none, per-packet, interval")
+	fs.DurationVar(&cfg.PaddingInterval, "padding-interval", 500*time.Millisecond, "")
 	fs.IntVar(&cfg.PaddingSize, "padding-size", 4096, "")
 	fs.BoolVar(&cfg.AcceptMultipart, "accept-multipart", true, "")
 	fs.StringVar(&cfg.MultipartFormName, "multipart-form", "file", "")

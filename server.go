@@ -107,7 +107,6 @@ func handleUp(cfg *ServerConfig, store *TunnelStore, w http.ResponseWriter, r *h
 	default:
 	}
 
-	// 等待 Down 侧就绪
 	waitCtx, cancel := context.WithTimeout(r.Context(), cfg.WaitPeerTimeout)
 	defer cancel()
 	select {
@@ -169,18 +168,23 @@ func handleDown(cfg *ServerConfig, store *TunnelStore, w http.ResponseWriter, r 
 		return
 	}
 
-	// TCP -> HTTP
+	fl := FrameLogger{Prefix: "server-down", LogHeartbeat: false}
+
 	go func() {
-		fl := FrameLogger{Prefix: "server-down"}
 		buf := make([]byte, cfg.BufferSize)
 		for {
 			n, err := tunnel.TCPConn.Read(buf)
 			if n > 0 {
-				_ = sw.WriteFrame(fl, FrameData, buf[:n])
-				if cfg.PaddingEnabled {
+				sw.SetPriority(true)
+				if e := sw.WriteFrame(fl, FrameData, buf[:n]); e != nil {
+					sw.SetPriority(false)
+					break
+				}
+				if cfg.PaddingMode == PaddingPerPacket {
 					_ = sw.WriteFrame(fl, FramePadding, make([]byte, cfg.PaddingSize))
 				}
 				flusher.Flush()
+				sw.SetPriority(false)
 			}
 			if err != nil {
 				break
@@ -190,17 +194,32 @@ func handleDown(cfg *ServerConfig, store *TunnelStore, w http.ResponseWriter, r 
 		tunnel.Close()
 	}()
 
-	hb := time.NewTicker(cfg.HeartbeatInterval)
-	if cfg.HeartbeatInterval <= 0 {
-		hb.Stop()
+	hbTicker := &time.Ticker{C: make(<-chan time.Time)}
+	if cfg.HeartbeatInterval > 0 {
+		hbTicker = time.NewTicker(cfg.HeartbeatInterval)
 	}
-	defer hb.Stop()
+	padTicker := &time.Ticker{C: make(<-chan time.Time)}
+	if cfg.PaddingMode == PaddingInterval && cfg.PaddingInterval > 0 {
+		padTicker = time.NewTicker(cfg.PaddingInterval)
+	}
+	defer hbTicker.Stop()
+	defer padTicker.Stop()
 
 	for {
 		select {
-		case <-hb.C:
-			_ = sw.WriteFrame(FrameLogger{Prefix: "server-down"}, FrameHeartbeat, nil)
+		case <-hbTicker.C:
+			if err := sw.WriteFrame(fl, FrameHeartbeat, nil); err != nil {
+				return
+			}
 			flusher.Flush()
+		case <-padTicker.C:
+			if sw.CheckAndResetDataSent() {
+				if _, err := sw.TryWriteFrame(fl, FramePadding, make([]byte, cfg.PaddingSize)); err == nil {
+					flusher.Flush()
+				} else if err != nil {
+					return
+				}
+			}
 		case <-r.Context().Done():
 			return
 		case <-tunnel.closeCh:

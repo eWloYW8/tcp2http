@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -16,6 +17,12 @@ const (
 	FrameClose     = 0x03
 	FramePadding   = 0x04
 	MaxFrameSize   = 10 * 1024 * 1024
+)
+
+const (
+	PaddingNone      = "none"
+	PaddingPerPacket = "per-packet"
+	PaddingInterval  = "interval"
 )
 
 func frameName(t byte) string {
@@ -65,28 +72,59 @@ func (fl FrameLogger) LogRecv(t byte, payloadLen int) {
 }
 
 type SafeWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu                 sync.Mutex
+	w                  io.Writer
+	priorityWaiting    atomic.Int32
+	dataSentInInterval atomic.Bool
 }
 
 func NewSafeWriter(w io.Writer) *SafeWriter { return &SafeWriter{w: w} }
 
+func (sw *SafeWriter) SetPriority(active bool) {
+	if active {
+		sw.priorityWaiting.Add(1)
+	} else {
+		sw.priorityWaiting.Add(-1)
+	}
+}
+
+func (sw *SafeWriter) CheckAndResetDataSent() bool {
+	return sw.dataSentInInterval.Swap(false)
+}
+
 func (sw *SafeWriter) WriteFrame(fl FrameLogger, t byte, payload []byte) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	return sw.writeRaw(fl, t, payload)
+}
+
+func (sw *SafeWriter) TryWriteFrame(fl FrameLogger, t byte, payload []byte) (bool, error) {
+	if sw.priorityWaiting.Load() > 0 {
+		return false, nil
+	}
+	if !sw.mu.TryLock() {
+		return false, nil
+	}
+	defer sw.mu.Unlock()
+	err := sw.writeRaw(fl, t, payload)
+	return true, err
+}
+
+func (sw *SafeWriter) writeRaw(fl FrameLogger, t byte, payload []byte) error {
+	if t == FrameData {
+		sw.dataSentInInterval.Store(true)
+	}
 
 	fl.LogSend(t, len(payload))
 	header := make([]byte, 5)
 	header[0] = t
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
-
 	if _, err := sw.w.Write(header); err != nil {
 		return err
 	}
 	if len(payload) > 0 {
-		if _, err := sw.w.Write(payload); err != nil {
-			return err
-		}
+		_, err := sw.w.Write(payload)
+		return err
 	}
 	return nil
 }
