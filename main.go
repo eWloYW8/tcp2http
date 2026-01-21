@@ -16,11 +16,11 @@ func main() {
 	switch os.Args[1] {
 	case "client":
 		if err := runClient(os.Args[2:]); err != nil {
-			log.Fatalf("client: %v", err)
+			fatalf("client: %v", err)
 		}
 	case "server":
 		if err := runServer(os.Args[2:]); err != nil {
-			log.Fatalf("server: %v", err)
+			fatalf("server: %v", err)
 		}
 	default:
 		printUsage()

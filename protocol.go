@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -64,14 +63,14 @@ func (fl FrameLogger) LogSend(t byte, channel uint32, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] >>> %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
+	logDebugf("[%s] >>> %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
 }
 
 func (fl FrameLogger) LogRecv(t byte, channel uint32, payloadLen int) {
 	if t == FrameHeartbeat && !fl.LogHeartbeat {
 		return
 	}
-	log.Printf("[%s] <<< %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
+	logDebugf("[%s] <<< %s | Ch=%d | Len=%d", fl.Prefix, frameName(t), channel, payloadLen)
 }
 
 type SafeWriter struct {

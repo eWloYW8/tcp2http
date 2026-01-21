@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -17,19 +16,22 @@ func runClient(args []string) error {
 	if err != nil {
 		return err
 	}
+	setLogLevel(cfg.LogLevel)
 	session, err := newClientSession(cfg)
 	if err != nil {
 		return err
 	}
+	logInfof("[client] session=%s http tunnel established", session.id)
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-	log.Printf("[client] listening on %s", cfg.ListenAddr)
+	logInfof("[client] listening on %s", cfg.ListenAddr)
 
 	go func() {
 		<-session.Done()
+		logWarnf("[client] session=%s closed: %v", session.id, session.Err())
 		_ = ln.Close()
 	}()
 
@@ -126,19 +128,24 @@ func newClientSession(cfg *ClientConfig) (*ClientSession, error) {
 }
 
 func (s *ClientSession) runUp(reqUp *http.Request) {
+	logInfof("[client] session=%s up stream start", s.id)
 	resp, err := s.httpClient.Do(reqUp)
 	if err != nil {
+		logErrorf("[client] session=%s up stream error: %v", s.id, err)
 		s.fail(err)
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
+	logWarnf("[client] session=%s up stream closed", s.id)
 	s.fail(fmt.Errorf("up-http-closed"))
 }
 
 func (s *ClientSession) runDown(reqDown *http.Request) {
+	logInfof("[client] session=%s down stream start", s.id)
 	resp, err := s.httpClient.Do(reqDown)
 	if err != nil {
+		logErrorf("[client] session=%s down stream error: %v", s.id, err)
 		s.fail(err)
 		return
 	}
@@ -158,9 +165,11 @@ func (s *ClientSession) runDown(reqDown *http.Request) {
 			}
 			ch := s.getChannel(channel)
 			if ch == nil {
+				logWarnf("[client] session=%s down frame for unknown channel=%d", s.id, channel)
 				continue
 			}
 			if _, err := ch.conn.Write(payload); err != nil {
+				logWarnf("[client] session=%s channel=%d write error: %v", s.id, channel, err)
 				s.closeChannel(channel)
 				_ = s.upWriter.WriteFrame(flUp, FrameClose, channel, nil)
 			}
@@ -168,10 +177,12 @@ func (s *ClientSession) runDown(reqDown *http.Request) {
 			if channel == 0 {
 				continue
 			}
+			logInfof("[client] session=%s channel=%d closed by server", s.id, channel)
 			s.closeChannel(channel)
 		case FrameHeartbeat, FramePadding, FrameOpen:
 		}
 	}
+	logWarnf("[client] session=%s down stream closed", s.id)
 	s.fail(fmt.Errorf("down-closed"))
 }
 
@@ -219,11 +230,13 @@ func (s *ClientSession) HandleConn(conn net.Conn) {
 
 	channelID := s.nextID.Add(1)
 	s.addChannel(channelID, conn)
+	logInfof("[client] session=%s channel=%d accepted", s.id, channelID)
 
 	flUp := FrameLogger{Prefix: "client-up", LogHeartbeat: s.cfg.LogHeartbeat}
 	if err := s.upWriter.WriteFrame(flUp, FrameOpen, channelID, nil); err != nil {
 		s.removeChannel(channelID)
 		_ = conn.Close()
+		logErrorf("[client] session=%s channel=%d open send error: %v", s.id, channelID, err)
 		s.fail(err)
 		return
 	}
@@ -242,6 +255,7 @@ func (s *ClientSession) pipeConn(channelID uint32, conn net.Conn) {
 			s.upWriter.SetPriority(true)
 			if e := s.upWriter.WriteFrame(flUp, FrameData, channelID, buf[:n]); e != nil {
 				s.upWriter.SetPriority(false)
+				logErrorf("[client] session=%s channel=%d up write error: %v", s.id, channelID, e)
 				s.fail(e)
 				return
 			}
@@ -251,11 +265,15 @@ func (s *ClientSession) pipeConn(channelID uint32, conn net.Conn) {
 			s.upWriter.SetPriority(false)
 		}
 		if err != nil {
+			if err != io.EOF {
+				logWarnf("[client] session=%s channel=%d tcp read error: %v", s.id, channelID, err)
+			}
 			break
 		}
 	}
 
 	if s.removeChannel(channelID) {
+		logInfof("[client] session=%s channel=%d closed by client", s.id, channelID)
 		_ = s.upWriter.WriteFrame(flUp, FrameClose, channelID, nil)
 	}
 }
@@ -265,6 +283,7 @@ func (s *ClientSession) fail(err error) {
 		if err == nil {
 			err = fmt.Errorf("session closed")
 		}
+		logErrorf("[client] session=%s error: %v", s.id, err)
 		s.err = err
 		close(s.done)
 		s.cancel()

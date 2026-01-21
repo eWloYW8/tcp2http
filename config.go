@@ -47,6 +47,7 @@ type ClientConfig struct {
 	PaddingSize              int
 	HTTPTimeout              time.Duration
 	LogHeartbeat             bool
+	LogLevel                 logLevel
 }
 
 type ServerConfig struct {
@@ -62,6 +63,7 @@ type ServerConfig struct {
 	AcceptMultipart   bool
 	MultipartFormName string
 	WaitPeerTimeout   time.Duration
+	LogLevel          logLevel
 }
 
 func parseClientFlags(args []string) (*ClientConfig, error) {
@@ -83,6 +85,7 @@ func parseClientFlags(args []string) (*ClientConfig, error) {
 	fs.IntVar(&cfg.PaddingSize, "padding-size", 4096, "")
 	fs.DurationVar(&cfg.HTTPTimeout, "http-timeout", 0, "")
 	fs.BoolVar(&cfg.LogHeartbeat, "log-heartbeat", false, "")
+	logLevelRaw := fs.String("log-level", "info", "")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -90,6 +93,11 @@ func parseClientFlags(args []string) (*ClientConfig, error) {
 	if cfg.UpURL == "" || cfg.DownURL == "" {
 		return nil, errors.New("missing urls")
 	}
+	level, err := parseLogLevel(*logLevelRaw)
+	if err != nil {
+		return nil, err
+	}
+	cfg.LogLevel = level
 	return cfg, nil
 }
 
@@ -109,9 +117,15 @@ func parseServerFlags(args []string) (*ServerConfig, error) {
 	fs.BoolVar(&cfg.AcceptMultipart, "accept-multipart", true, "")
 	fs.StringVar(&cfg.MultipartFormName, "multipart-form", "file", "")
 	fs.DurationVar(&cfg.WaitPeerTimeout, "wait-peer-timeout", 30*time.Second, "")
+	logLevelRaw := fs.String("log-level", "info", "")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
+	level, err := parseLogLevel(*logLevelRaw)
+	if err != nil {
+		return nil, err
+	}
+	cfg.LogLevel = level
 	return cfg, nil
 }

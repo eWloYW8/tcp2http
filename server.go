@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -167,11 +166,12 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	setLogLevel(cfg.LogLevel)
 	store := NewSessionStore()
 	mux := http.NewServeMux()
 	mux.HandleFunc(cfg.UpPath, func(w http.ResponseWriter, r *http.Request) { handleUp(cfg, store, w, r) })
 	mux.HandleFunc(cfg.DownPath, func(w http.ResponseWriter, r *http.Request) { handleDown(cfg, store, w, r) })
-	log.Printf("[server] listening on %s", cfg.HTTPListenAddr)
+	logInfof("[server] listening on %s", cfg.HTTPListenAddr)
 	return http.ListenAndServe(cfg.HTTPListenAddr, mux)
 }
 
@@ -179,6 +179,8 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 	id := r.Header.Get(cfg.SessionHeader)
 	session := store.GetOrCreate(id)
 	defer store.Delete(id)
+	logInfof("[server] session=%s up connected", id)
+	defer logInfof("[server] session=%s up disconnected", id)
 
 	var reader io.ReadCloser = r.Body
 	if cfg.AcceptMultipart && strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
@@ -201,8 +203,10 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 	select {
 	case <-session.downReady:
 	case <-waitCtx.Done():
+		logWarnf("[server] session=%s up wait down timeout", id)
 		return
 	case <-session.closeCh:
+		logWarnf("[server] session=%s up closed before down ready", id)
 		return
 	}
 
@@ -220,10 +224,12 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 				continue
 			}
 			if session.GetChannel(channel) != nil {
+				logWarnf("[server] session=%s channel=%d open duplicated", id, channel)
 				continue
 			}
 			conn, err := net.DialTimeout("tcp", cfg.TargetTCP, 5*time.Second)
 			if err != nil {
+				logErrorf("[server] session=%s channel=%d dial %s error: %v", id, channel, cfg.TargetTCP, err)
 				if sw := session.DownWriter(); sw != nil {
 					_ = sw.WriteFrame(flDown, FrameClose, channel, nil)
 				}
@@ -233,6 +239,7 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 				_ = conn.Close()
 				continue
 			}
+			logInfof("[server] session=%s channel=%d opened to %s", id, channel, cfg.TargetTCP)
 			startServerChannel(cfg, session, channel)
 		case FrameData:
 			if channel == 0 {
@@ -240,9 +247,11 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 			}
 			ch := session.GetChannel(channel)
 			if ch == nil {
+				logWarnf("[server] session=%s data for unknown channel=%d", id, channel)
 				continue
 			}
 			if _, err := ch.conn.Write(payload); err != nil {
+				logWarnf("[server] session=%s channel=%d write error: %v", id, channel, err)
 				session.CloseChannel(channel)
 				if sw := session.DownWriter(); sw != nil {
 					_ = sw.WriteFrame(flDown, FrameClose, channel, nil)
@@ -252,6 +261,7 @@ func handleUp(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r *
 			if channel == 0 {
 				continue
 			}
+			logInfof("[server] session=%s channel=%d closed by client", id, channel)
 			session.CloseChannel(channel)
 		case FrameHeartbeat, FramePadding:
 		}
@@ -262,6 +272,8 @@ func handleDown(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r
 	id := r.Header.Get(cfg.SessionHeader)
 	session := store.GetOrCreate(id)
 	defer store.Delete(id)
+	logInfof("[server] session=%s down connected", id)
+	defer logInfof("[server] session=%s down disconnected", id)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -281,8 +293,10 @@ func handleDown(cfg *ServerConfig, store *SessionStore, w http.ResponseWriter, r
 	select {
 	case <-session.upReady:
 	case <-waitCtx.Done():
+		logWarnf("[server] session=%s down wait up timeout", id)
 		return
 	case <-session.closeCh:
+		logWarnf("[server] session=%s down closed before up ready", id)
 		return
 	}
 
@@ -315,6 +329,7 @@ func startServerChannel(cfg *ServerConfig, session *ServerSession, channelID uin
 				downWriter.SetPriority(true)
 				if e := downWriter.WriteFrame(fl, FrameData, channelID, buf[:n]); e != nil {
 					downWriter.SetPriority(false)
+					logErrorf("[server] session=%s channel=%d down write error: %v", session.id, channelID, e)
 					session.Close()
 					return
 				}
@@ -324,10 +339,14 @@ func startServerChannel(cfg *ServerConfig, session *ServerSession, channelID uin
 				downWriter.SetPriority(false)
 			}
 			if err != nil {
+				if err != io.EOF {
+					logWarnf("[server] session=%s channel=%d tcp read error: %v", session.id, channelID, err)
+				}
 				break
 			}
 		}
 
+		logInfof("[server] session=%s channel=%d closed by target", session.id, channelID)
 		_ = downWriter.WriteFrame(fl, FrameClose, channelID, nil)
 		session.RemoveChannel(channelID)
 	}()
